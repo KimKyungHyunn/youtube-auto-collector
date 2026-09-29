@@ -13,10 +13,11 @@ from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import RequestBlocked
 
 from config import (
-    BROAD_SEARCH_KEYWORDS,
-    DEDICATED_SEARCHES,
+    CATEGORIES,
+    CHANNEL_MAX_PER_RUN,
+    CHANNEL_OVERFETCH,
+    KEYWORD_OVERFETCH,
     YOUTUBE_API_KEY,
-    YOUTUBE_OVERFETCH,
     get_date_range,
 )
 
@@ -33,17 +34,18 @@ class Video:
     title: str
     channel: str
     published: str
+    category: str = ""
+    source_type: str = ""  # "channel" | "keyword"
     view_count: int = 0
     transcript: str | None = None
-    search_group: str = ""
     url: str = field(init=False)
 
     def __post_init__(self):
         self.url = f"https://www.youtube.com/watch?v={self.video_id}"
 
 
-def _search_videos(query: str, max_results: int) -> list[dict]:
-    """YouTube Data API search.list 호출."""
+def _search_by_keyword(query: str, max_results: int) -> list[dict]:
+    """키워드 검색 — 기간 내 조회수순."""
     youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
     since, _ = get_date_range()
 
@@ -64,22 +66,71 @@ def _search_videos(query: str, max_results: int) -> list[dict]:
     return response.get("items", [])
 
 
-def _get_view_counts(video_ids: list[str]) -> dict[str, int]:
-    """videos.list로 조회수 일괄 조회 (50개씩 배치)."""
+def _search_by_channel(channel_id: str, max_results: int) -> list[dict]:
+    """구독 채널 검색 — 기간 내 최신 영상순."""
     youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
-    counts = {}
+    since, _ = get_date_range()
+
+    response = (
+        youtube.search()
+        .list(
+            channelId=channel_id,
+            part="snippet",
+            type="video",
+            order="date",
+            publishedAfter=since.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            maxResults=min(max_results, 50),
+        )
+        .execute()
+    )
+    return response.get("items", [])
+
+
+def _fetch_stats(video_ids: list[str]) -> dict[str, dict]:
+    """videos.list로 조회수 + 라이브 여부 일괄 조회 (50개씩 배치).
+
+    라이브(방송) 영상은 liveStreamingDetails 필드를 가지므로 그것으로 다시보기를 판별.
+    Returns: {video_id: {"view": int, "is_live": bool}}
+    """
+    youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
+    meta: dict[str, dict] = {}
     for i in range(0, len(video_ids), 50):
         batch = video_ids[i : i + 50]
         response = (
             youtube.videos()
-            .list(part="statistics", id=",".join(batch))
+            .list(part="statistics,liveStreamingDetails", id=",".join(batch))
             .execute()
         )
         for item in response.get("items", []):
-            counts[item["id"]] = int(
-                item["statistics"].get("viewCount", 0)
-            )
-    return counts
+            meta[item["id"]] = {
+                "view": int(item.get("statistics", {}).get("viewCount", 0)),
+                "is_live": "liveStreamingDetails" in item,
+            }
+    return meta
+
+
+def fetch_video_meta(video_id: str, category: str = "") -> Video | None:
+    """단일 영상 메타데이터 조회 (온디맨드용). 없으면 None."""
+    youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
+    resp = (
+        youtube.videos()
+        .list(part="snippet,statistics", id=video_id)
+        .execute()
+    )
+    items = resp.get("items", [])
+    if not items:
+        return None
+    sn = items[0]["snippet"]
+    stats = items[0].get("statistics", {})
+    return Video(
+        video_id=video_id,
+        title=sn.get("title", ""),
+        channel=sn.get("channelTitle", ""),
+        published=sn.get("publishedAt", ""),
+        category=category,
+        source_type="ondemand",
+        view_count=int(stats.get("viewCount", 0)),
+    )
 
 
 def _backoff_sleep(attempt: int) -> None:
@@ -179,69 +230,100 @@ def get_transcript(video_id: str) -> tuple[str | None, bool]:
     return transcript, blocked and ytdlp_blocked
 
 
-def _search_group(query_keywords: list[str], group_name: str) -> list[Video]:
-    """키워드 리스트로 검색하고 그룹 내 중복 제거 후 Video 리스트 반환."""
-    seen_ids: set[str] = set()
+def _items_to_videos(
+    items: list[dict],
+    category: str,
+    source_type: str,
+    seen_ids: set[str],
+) -> list[Video]:
+    """search.list 응답 → Video 리스트 (호출 간 중복 제거)."""
     videos: list[Video] = []
-
-    for kw in query_keywords:
-        items = _search_videos(kw, YOUTUBE_OVERFETCH)
-        for item in items:
-            vid = item["id"]["videoId"]
-            if vid in seen_ids:
-                continue
-            seen_ids.add(vid)
-            snippet = item["snippet"]
-            videos.append(
-                Video(
-                    video_id=vid,
-                    title=snippet.get("title", ""),
-                    channel=snippet.get("channelTitle", ""),
-                    published=snippet.get("publishedAt", ""),
-                    search_group=group_name,
-                )
+    for item in items:
+        vid = item["id"]["videoId"]
+        if vid in seen_ids:
+            continue
+        seen_ids.add(vid)
+        snippet = item["snippet"]
+        videos.append(
+            Video(
+                video_id=vid,
+                title=snippet.get("title", ""),
+                channel=snippet.get("channelTitle", ""),
+                published=snippet.get("publishedAt", ""),
+                category=category,
+                source_type=source_type,
             )
-
-    # 조회수 일괄 조회
-    if videos:
-        counts = _get_view_counts([v.video_id for v in videos])
-        for v in videos:
-            v.view_count = counts.get(v.video_id, 0)
-        videos.sort(key=lambda v: v.view_count, reverse=True)
-
+        )
     return videos
 
 
+def _drop_live_fill_views(videos: list[Video], limit: int | None = None) -> list[Video]:
+    """라이브 다시보기 제외 + 조회수 채우기. limit이 있으면 그만큼만 확보(입력 순서 유지)."""
+    if not videos:
+        return []
+    meta = _fetch_stats([v.video_id for v in videos])
+    kept: list[Video] = []
+    for v in videos:
+        m = meta.get(v.video_id, {})
+        if m.get("is_live"):
+            continue  # 라이브 다시보기 제외
+        v.view_count = m.get("view", 0)
+        kept.append(v)
+        if limit is not None and len(kept) >= limit:
+            break
+    return kept
+
+
+def collect_category(category: str, cfg: dict) -> list[Video]:
+    """한 카테고리에서 구독채널 + 키워드 검색으로 영상 후보 수집 (자막 미포함).
+
+    - 구독채널: 최신순 오버페치 → 라이브 제외 후 채널당 CHANNEL_MAX_PER_RUN개 보장
+    - 키워드: 조회수순 오버페치 → 라이브 제외 (DB dedup 뒤 상위 N 선별은 dedup 단계에서)
+    """
+    seen_ids: set[str] = set()
+    channel_videos: list[Video] = []
+    keyword_videos: list[Video] = []
+
+    for _ch_name, ch_id in cfg.get("channels", {}).items():
+        items = _search_by_channel(ch_id, CHANNEL_OVERFETCH)
+        cand = _items_to_videos(items, category, "channel", seen_ids)
+        channel_videos.extend(_drop_live_fill_views(cand, limit=CHANNEL_MAX_PER_RUN))
+
+    for kw in cfg.get("keywords", []):
+        items = _search_by_keyword(kw, KEYWORD_OVERFETCH)
+        keyword_videos.extend(_items_to_videos(items, category, "keyword", seen_ids))
+    keyword_videos = _drop_live_fill_views(keyword_videos)
+
+    return channel_videos + keyword_videos
+
+
 def collect_youtube() -> dict[str, list[Video]]:
-    """모든 키워드 그룹에서 YouTube 영상 수집 (자막 미포함 단계).
+    """모든 카테고리에서 YouTube 영상 후보 수집 (자막 미포함 단계).
 
     Returns:
-        {"에이전트 코딩": [Video, ...], "에이전트 트렌드": [...], "broad": [...]}
+        {"AI": [Video, ...], "경제": [...], "부동산": [...]}
     """
     results: dict[str, list[Video]] = {}
-
-    for group_name, keywords in DEDICATED_SEARCHES.items():
-        results[group_name] = _search_group(keywords, group_name)
-
-    results["broad"] = _search_group(BROAD_SEARCH_KEYWORDS, "broad")
-
+    for category, cfg in CATEGORIES.items():
+        results[category] = collect_category(category, cfg)
     return results
 
 
-def enrich_transcripts(videos: list[Video], limit: int = 5) -> list[Video]:
-    """상위 N개 영상에 자막 추출. dedup 적용 후 호출하는 것을 권장.
+def enrich_transcripts(videos: list[Video]) -> list[Video]:
+    """주어진 영상 전부에 자막 추출. DB dedup·선별 이후 호출하는 것을 권장.
 
     연속으로 차단(429)이 감지되면 영상 간 대기 시간을 점점 늘려 IP 차단이
     풀릴 시간을 준다.
     """
     consecutive_blocks = 0
-    for i, v in enumerate(videos[:limit]):
+    n = len(videos)
+    for i, v in enumerate(videos):
         v.transcript, blocked = get_transcript(v.video_id)
         consecutive_blocks = consecutive_blocks + 1 if blocked else 0
-        if i < limit - 1:
+        if i < n - 1:
             wait = BASE_INTERVAL_SECONDS + random.uniform(2, 6) + consecutive_blocks * 15
             time.sleep(wait)
-    return videos[:limit]
+    return videos
 
 
 if __name__ == "__main__":

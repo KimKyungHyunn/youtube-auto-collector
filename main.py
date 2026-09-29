@@ -1,102 +1,87 @@
-"""주간 AI 트렌드 수집 파이프라인.
+"""유튜브 영상별 수집 파이프라인.
 
-수집 → 중복 제거 → 자막 추출 → JSON 출력.
-요약은 Claude Code 클라우드 예약 작업에서 직접 수행 (Anthropic API 별도 호출 없음).
+카테고리(AI/경제/부동산)별 구독채널 + 키워드 검색 → 중복제거/선별 →
+자막 추출 → 자막 있는 영상만 JSON 출력.
+영상별 요약은 Claude Code 클라우드 예약 작업에서 수행 (Anthropic API 별도 호출 없음).
+
+사용법:
+    python main.py                # 전체 카테고리
+    python main.py --category 경제  # 특정 카테고리만 (배치 주기 분리용)
 """
 
 import dataclasses
 import json
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
-from collectors.news import collect_news
-from collectors.youtube import collect_youtube, enrich_transcripts
-from dedup import dedup_articles, dedup_videos
+from collectors.youtube import collect_category, enrich_transcripts
+from config import CATEGORIES, get_date_range
+from dedup import fetch_seen_ids, filter_and_rank, mark_seen
 
 
-def _to_serializable(obj):
-    """dataclass → dict 변환."""
-    if dataclasses.is_dataclass(obj):
-        return dataclasses.asdict(obj)
-    raise TypeError(f"{type(obj)} is not JSON serializable")
-
-
-def run(skip_dedup: bool = False) -> Path:
+def run(only_category: str | None = None) -> Path:
     """수집 파이프라인 실행. 결과 JSON 경로 반환."""
 
-    # 1. 수집
-    print("[1/4] 뉴스 수집 중...")
-    raw_news = collect_news()
-    for group, articles in raw_news.items():
-        print(f"  {group}: {len(articles)}건 수집")
+    categories = (
+        {only_category: CATEGORIES[only_category]}
+        if only_category
+        else CATEGORIES
+    )
 
-    print("[2/4] YouTube 검색 중...")
-    raw_videos = collect_youtube()
-    for group, videos in raw_videos.items():
-        print(f"  {group}: {len(videos)}건 검색")
+    # 1. 수집 (구독채널 + 키워드)
+    print("[1/4] YouTube 후보 수집 중...")
+    candidates: dict[str, list] = {}
+    for name, cfg in categories.items():
+        candidates[name] = collect_category(name, cfg)
+        print(f"  {name}: {len(candidates[name])}건 후보")
 
-    # 2. 중복 제거
-    if skip_dedup:
-        print("[3/4] 중복 제거 건너뜀 (--skip-dedup)")
-        news = raw_news
-        videos_filtered = raw_videos
-    else:
-        print("[3/4] 중복 제거 중...")
-        news = dedup_articles(raw_news)
-        videos_filtered = dedup_videos(raw_videos)
+    # 2. 중복 제거 + 선별 (seen 제외, 키워드 상위 N)
+    print("[2/4] 중복 제거 + 선별 중...")
+    seen = fetch_seen_ids()
+    selected = filter_and_rank(candidates, seen)
+    for name in selected:
+        print(f"  {name}: {len(selected[name])}건 선별")
 
-    for group in news:
-        print(f"  뉴스 {group}: {len(news[group])}건")
-    for group in videos_filtered:
-        print(f"  유튜브 {group}: {len(videos_filtered[group])}건")
+    # 3. 자막 추출 (자막 있는 영상만 남김)
+    print("[3/4] 자막 추출 중...")
+    kept: dict[str, list] = {}
+    for name, videos in selected.items():
+        enrich_transcripts(videos)
+        kept[name] = [v for v in videos if v.transcript]
+        print(f"  {name}: {len(kept[name])}/{len(videos)}건 자막 확보")
 
-    # 3. 자막 추출
-    print("[4/4] YouTube 자막 추출 중...")
-    for group, group_videos in videos_filtered.items():
-        videos_filtered[group] = enrich_transcripts(group_videos)
-        with_transcript = sum(1 for v in videos_filtered[group] if v.transcript)
-        print(f"  {group}: {with_transcript}/{len(videos_filtered[group])}건 자막 확보")
+    # seen 기록 — 실제 저장될(자막 확보) 영상만
+    new_ids = [v.video_id for vids in kept.values() for v in vids]
+    mark_seen(new_ids)
 
     # 4. JSON 출력
-    now = datetime.now(timezone.utc)
-    week_start = (now - timedelta(days=7)).strftime("%Y-%m-%d")
-    week_end = now.strftime("%Y-%m-%d")
-
+    since, now = get_date_range()
+    period = f"{since.strftime('%Y-%m-%d')} ~ {now.strftime('%Y-%m-%d')}"
     output = {
-        "meta": {
-            "week": f"{week_start} ~ {week_end}",
-            "collected_at": now.isoformat(),
-        },
-        "news": {
-            group: [dataclasses.asdict(a) for a in articles]
-            for group, articles in news.items()
-        },
-        "youtube": {
-            group: [dataclasses.asdict(v) for v in vids]
-            for group, vids in videos_filtered.items()
+        "meta": {"period": period, "collected_at": now.isoformat()},
+        "videos": {
+            name: [dataclasses.asdict(v) for v in vids]
+            for name, vids in kept.items()
         },
     }
-
     output_dir = Path("output")
     output_dir.mkdir(exist_ok=True)
-    output_path = output_dir / f"collected_{week_end}.json"
+    output_path = output_dir / f"collected_{now.strftime('%Y-%m-%d')}.json"
     output_path.write_text(json.dumps(output, ensure_ascii=False, indent=2))
 
+    total = sum(len(v) for v in kept.values())
     print(f"\n수집 완료 → {output_path}")
-
-    # 요약 통계
-    total_news = sum(len(a) for a in news.values())
-    total_videos = sum(len(v) for v in videos_filtered.values())
-    total_transcripts = sum(
-        sum(1 for v in vids if v.transcript)
-        for vids in videos_filtered.values()
-    )
-    print(f"뉴스 {total_news}건 / 유튜브 {total_videos}건 (자막 {total_transcripts}건)")
-
+    print(f"자막 확보 영상 총 {total}건")
     return output_path
 
 
 if __name__ == "__main__":
-    skip = "--skip-dedup" in sys.argv
-    run(skip_dedup=skip)
+    category = None
+    if "--category" in sys.argv:
+        idx = sys.argv.index("--category")
+        category = sys.argv[idx + 1]
+        if category not in CATEGORIES:
+            print(f"알 수 없는 카테고리: {category} (가능: {list(CATEGORIES)})")
+            sys.exit(1)
+    run(only_category=category)

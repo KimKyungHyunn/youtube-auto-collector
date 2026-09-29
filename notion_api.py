@@ -52,3 +52,13 @@ def create_page(db_id: str, properties: dict, children: list | None = None) -> d
 
 def retrieve_database(db_id: str) -> dict:
     return _get(f"databases/{db_id}")
+
+
+def create_database(parent_page_id: str, title: str, properties: dict) -> dict:
+    """부모 페이지 아래에 데이터베이스 생성."""
+    body = {
+        "parent": {"type": "page_id", "page_id": parent_page_id},
+        "title": [{"type": "text", "text": {"content": title}}],
+        "properties": properties,
+    }
+    return _post("databases", body)
