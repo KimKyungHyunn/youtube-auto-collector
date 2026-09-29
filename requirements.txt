@@ -6,3 +6,4 @@ anthropic>=0.30
 notion-client>=2.0
 requests>=2.30
 python-dotenv>=1.0
+cffi>=1.16
