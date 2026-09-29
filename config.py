@@ -16,6 +16,8 @@ SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 NOTION_VIDEOS_DB_ID = os.environ.get("NOTION_VIDEOS_DB_ID", "")
 # 중복 제거용 seen-video-id DB
 NOTION_SEEN_VIDEOS_DB_ID = os.environ.get("NOTION_SEEN_VIDEOS_DB_ID", "")
+# 다이제스트 페이지를 생성할 부모 페이지
+NOTION_DIGEST_PARENT_ID = os.environ.get("NOTION_DIGEST_PARENT_ID", "")
 
 # --- Collection parameters ---
 COLLECTION_PERIOD_DAYS = 7
