@@ -126,7 +126,7 @@ def _build_properties(v: dict, collected_date: str) -> dict:
     if v.get("topics"):
         props["세부주제"] = {"multi_select": [{"name": t} for t in v["topics"]]}
     if v.get("source_type"):
-        label = {"channel": "구독채널", "keyword": "키워드검색"}.get(
+        label = {"channel": "구독채널", "keyword": "키워드검색", "video": "직접지정"}.get(
             v["source_type"], v["source_type"]
         )
         props["출처유형"] = {"select": {"name": label}}

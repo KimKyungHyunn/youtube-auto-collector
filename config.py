@@ -30,6 +30,14 @@ CHANNEL_MAX_PER_RUN = 5
 # 구독 채널: 라이브 제외 전 오버페치 개수 (여기서 라이브 걸러내고 상한만큼 확보)
 CHANNEL_OVERFETCH = 15
 
+# --- 수동 수집 입력 (adhoc.json) ---
+ADHOC_FILE = "adhoc.json"
+ADHOC_LABEL = "수동"
+ADHOC_MAX_KEYWORDS = 10
+ADHOC_MAX_CHANNELS = 5
+ADHOC_MAX_VIDEOS = 20
+ADHOC_MAX_ITEM_LEN = 100
+
 # --- Categories (카테고리 → 키워드 / 구독채널 / 세부주제 태그) ---
 # keywords: 발견형 검색어 (search.list)
 # channels: {채널명: channelId} 구독 채널 (기간 내 최신 영상 수집)

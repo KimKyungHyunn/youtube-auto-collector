@@ -3,6 +3,7 @@
 import glob
 import json
 import random
+import re
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -131,6 +132,53 @@ def fetch_video_meta(video_id: str, category: str = "") -> Video | None:
         source_type="ondemand",
         view_count=int(stats.get("viewCount", 0)),
     )
+
+
+_CHANNEL_ID_RE = re.compile(r"^UC[\w-]{22}$")
+
+
+def _norm_name(name: str) -> str:
+    return "".join(name.split()).casefold()
+
+
+def resolve_channel(token: str) -> tuple[str, str] | None:
+    """채널 ID / @핸들 / 채널명 → (channel_id, 채널명). 못 찾으면 None.
+
+    채널명은 정확히 일치하는 채널만 인정하고, 여럿이면 구독자 수가 가장 많은 것을 고른다.
+    일치하는 채널이 없으면 엉뚱한 채널을 잡지 않도록 후보만 출력하고 None.
+    """
+    if _CHANNEL_ID_RE.match(token):
+        return token, token
+
+    youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
+    if token.startswith("@"):
+        items = (
+            youtube.channels().list(part="snippet", forHandle=token).execute().get("items", [])
+        )
+        return (items[0]["id"], items[0]["snippet"]["title"]) if items else None
+
+    found = (
+        youtube.search()
+        .list(q=token, part="snippet", type="channel", maxResults=10)
+        .execute()
+        .get("items", [])
+    )
+    ids = [i["id"]["channelId"] for i in found]
+    if not ids:
+        return None
+    channels = (
+        youtube.channels()
+        .list(part="snippet,statistics", id=",".join(ids))
+        .execute()
+        .get("items", [])
+    )
+    exact = [c for c in channels if _norm_name(c["snippet"]["title"]) == _norm_name(token)]
+    if not exact:
+        for c in channels[:3]:
+            print(f"    후보: {c['snippet']['title']} ({c['id']})")
+        return None
+    best = max(exact, key=lambda c: int(c.get("statistics", {}).get("subscriberCount", 0)))
+    return best["id"], best["snippet"]["title"]
 
 
 def _backoff_sleep(attempt: int) -> None:
