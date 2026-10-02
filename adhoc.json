@@ -2,6 +2,11 @@
   "label": "수동",
   "channels": [],
   "keywords": [],
-  "videos": [],
-  "force": false
+  "videos": [
+    "https://www.youtube.com/watch?v=OL7LQaUitGE",
+    "rLRoKm6Mg80",
+    "zArdfiZbta4",
+    "https://www.youtube.com/watch?v=SGNaTI8h26A"
+  ],
+  "force": true
 }
