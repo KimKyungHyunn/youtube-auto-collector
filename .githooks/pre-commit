@@ -1,0 +1,57 @@
+#!/usr/bin/env python3
+"""커밋 전 민감 파일·시크릿 패턴 감지. 설치: git config core.hooksPath .githooks
+
+위반 시 exit 1로 커밋 거부. 오탐이면 git commit --no-verify 로 우회 가능.
+"""
+import re
+import subprocess
+import sys
+
+SENSITIVE_PATH = re.compile(
+    r"(?:^|/)(?:\.env(?!\.example)|cookies?[^/]*\.(?:txt|json|jar)|.*\.(?:pem|key|p12|pfx)|secrets?/)",
+    re.IGNORECASE,
+)
+
+SECRET_PATTERNS = [
+    ("Google API key", re.compile(r"AIza[0-9A-Za-z_-]{35}")),
+    ("Notion secret",  re.compile(r"secret_[A-Za-z0-9]{30,}")),
+    ("Notion token",   re.compile(r"ntn_[A-Za-z0-9]{40,}")),
+    ("Slack webhook",  re.compile(r"hooks\.slack\.com/services/[A-Z0-9/]{20,}")),
+    ("Anthropic key",  re.compile(r"sk-ant-[A-Za-z0-9_-]{20,}")),
+    ("GitHub PAT",     re.compile(r"ghp_[A-Za-z0-9]{30,}")),
+    ("Private key",    re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |)PRIVATE KEY-----")),
+]
+
+
+def git(*args: str) -> str:
+    return subprocess.check_output(["git", *args], text=True)
+
+
+def main() -> int:
+    violations: list[str] = []
+
+    for path in git("diff", "--cached", "--name-only").splitlines():
+        if SENSITIVE_PATH.search(path):
+            violations.append(f"민감 파일: {path}")
+
+    diff = git("diff", "--cached", "-U0")
+    for line in diff.splitlines():
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        for name, pat in SECRET_PATTERNS:
+            if pat.search(line):
+                violations.append(f"시크릿 패턴({name}): {line[:80]}")
+                break
+
+    if not violations:
+        return 0
+
+    sys.stderr.write("커밋 차단 (CLAUDE.md 금지 사항):\n")
+    for v in violations[:10]:
+        sys.stderr.write(f"  - {v}\n")
+    sys.stderr.write("\n확인 후 다시 커밋하거나, 오탐이면 --no-verify 로 우회할 수 있습니다.\n")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
